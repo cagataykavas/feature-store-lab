@@ -8,20 +8,49 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: .
-      FEATURE_STORE_DATABASE_PATH: /tmp/features_ci.db
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: ruff check feature_store.py app storage tests
+      - run: ruff check .
+      - run: ruff format --check .
       - run: pytest -q
+      - run: |
+          mkdir -p evidence
+          feature-platform-evidence > evidence/reference-run.json
+          python -m json.tool evidence/reference-run.json >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feature-platform-evidence
+          path: evidence/reference-run.json
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --wheel
+      - run: |
+          python -m venv /tmp/feature-platform-wheel
+          /tmp/feature-platform-wheel/bin/pip install dist/*.whl
+          /tmp/feature-platform-wheel/bin/feature-platform-evidence >/tmp/evidence.json
+          /tmp/feature-platform-wheel/bin/python -m json.tool /tmp/evidence.json >/dev/null
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t feature-store-service:ci .
+      - run: |
+          docker run -d --name feature-store -p 8000:8000 feature-store-service:ci
+          for attempt in {1..20}; do
+            curl --fail --silent http://127.0.0.1:8000/health && exit 0
+            sleep 1
+          done
+          docker logs feature-store
+          exit 1

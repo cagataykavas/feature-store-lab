@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 import json
 import sqlite3
 import threading
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from pathlib import Path
 
 from feature_store import FeatureRow
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS feature_rows (
@@ -44,8 +43,8 @@ class SQLiteOfflineFeatureStore:
     @staticmethod
     def _normalize_time(value: datetime) -> str:
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat()
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat()
 
     def write(self, row: FeatureRow) -> None:
         values_json = json.dumps(row.values, sort_keys=True, separators=(",", ":"))
@@ -86,7 +85,7 @@ class SQLiteOfflineFeatureStore:
         )
 
     def latest(self, entity_id: str) -> FeatureRow:
-        return self.get_as_of(entity_id, datetime.now(timezone.utc))
+        return self.get_as_of(entity_id, datetime.now(UTC))
 
     def changed_since(self, watermark: datetime | None, limit: int = 1000) -> list[FeatureRow]:
         query = "SELECT entity_id, event_time, values_json FROM feature_rows"
@@ -102,10 +101,7 @@ class SQLiteOfflineFeatureStore:
             FeatureRow(
                 entity_id=row["entity_id"],
                 event_time=datetime.fromisoformat(row["event_time"]),
-                values={
-                    key: float(value)
-                    for key, value in json.loads(row["values_json"]).items()
-                },
+                values={key: float(value) for key, value in json.loads(row["values_json"]).items()},
             )
             for row in rows
         ]

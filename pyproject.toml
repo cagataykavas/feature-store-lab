@@ -4,17 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feature-store-service"
-version = "0.2.0"
-description = "Point-in-time correct offline/online feature store reference service"
+version = "1.0.0"
+description = "Versioned feature platform with leakage-safe joins and transactional materialization"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
 
+[project.scripts]
+feature-platform-evidence = "feature_platform.evidence:main"
+
 [tool.setuptools]
 py-modules = ["feature_store"]
-packages = ["app", "storage"]
+packages = ["app", "feature_platform", "storage"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

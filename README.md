@@ -1,126 +1,166 @@
-# Feature Store Service
+# Feature Platform Control Plane
 
-A small but complete **offline/online feature platform** focused on the failure mode that matters most in ML systems: **training/serving skew and point-in-time leakage**.
+A runnable feature platform that treats data correctness as a set of enforced invariants—not a diagram. It provides versioned feature schemas, immutable/idempotent ingestion, leakage-safe training joins, durable online serving, transactional materialization, freshness policy and online/offline parity checks.
 
-The project started as an in-memory reference implementation and now includes a durable offline store, low-latency online serving, incremental materialization, freshness tracking, REST APIs, Docker packaging, tests and CI.
+The repository began as a small offline/online store. The current implementation is a package with explicit domain, application, persistence and HTTP boundaries backed by 18 regression tests and three CI jobs.
+
+## What can go wrong
+
+The original materializer used an event-time watermark:
+
+```sql
+WHERE event_time > :watermark
+ORDER BY event_time
+LIMIT :batch_size
+```
+
+If three rows had the same event timestamp and the batch size was two, the watermark advanced to that timestamp and the third row was never read. The current implementation checkpoints a monotonic ingestion sequence and commits online writes and the cursor in one SQLite transaction.
+
+| Invariant | Enforcement |
+|---|---|
+| No future leakage | `event_time <= label_time` point-in-time lookup |
+| No backfill leakage | Optional `created_at <= dataset_cutoff` constraint |
+| No silent mutation | Immutable logical key plus content hash |
+| Safe retries | Stable ingestion ID returns the original row |
+| No batch-boundary loss | Monotonic sequence cursor, independent of event time |
+| No online rollback | Compare-and-set on event time, then sequence |
+| One active materializer | Expiring owner lease |
+| Training/serving consistency | Online/offline row-sequence and value parity |
+| Explicit stale data | Per-view TTL and serving age metadata |
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    EVENTS[Feature producers] --> OFF[(SQLite offline store)]
-    OFF --> PIT[Point-in-time reads]
-    OFF --> MAT[Incremental materializer]
-    MAT --> ONLINE[(Online store adapter)]
-    ONLINE --> API[FastAPI serving API]
-    PIT --> TRAIN[Training / backfill jobs]
-    API --> MODEL[Realtime model service]
-    MAT --> FRESH[Freshness watermark]
+flowchart TD
+    Producer[Feature producer] --> Registry[Versioned schema registry]
+    Producer --> Ingest[Validated immutable ingestion]
+    Registry --> Ingest
+    Ingest --> Offline[(Offline rows + sequence)]
+    Offline --> Join[Point-in-time training join]
+    Offline --> Worker[Leased materializer]
+    Worker --> Online[(Durable online table)]
+    Online --> Serving[Online API + freshness]
+    Offline --> Parity[Parity verifier]
+    Online --> Parity
 ```
 
-## Why this exists
+The local adapter deliberately uses SQLite so every invariant is runnable without cloud credentials. In production the same boundaries map to a warehouse/lakehouse for historical rows, Redis or DynamoDB for online serving, and a scheduled worker for materialization.
 
-Feature engineering code is easy to demo in a notebook. The production problem is making sure a model sees **the same feature definitions at training time and inference time without leaking future information**.
+## Domain model
 
-This repository demonstrates:
+- `FeatureView` is an immutable, fingerprinted schema version.
+- `FeatureDefinition` declares name, scalar type, nullability and documentation.
+- `FeatureRow` carries event time, ingestion time, logical identity and content hash.
+- `TrainingExample` preserves label time and the exact source row sequence.
+- `OnlineFeature` returns values together with age and stale status.
 
-- point-in-time correct offline retrieval;
-- persistent event-time feature rows;
-- latest-value online materialization;
-- incremental watermarks;
-- freshness/lag reporting;
-- idempotent feature writes for the same entity and event timestamp;
-- a storage abstraction that can later be replaced by PostgreSQL/BigQuery/S3/Redis;
-- REST serving boundaries;
-- Docker and CI.
+Compatible schema evolution may add nullable features. Removing a feature, changing its type, changing the entity type or adding a required field is rejected. A version already registered under the same name cannot be mutated.
 
-## API
+## API walkthrough
 
-Run locally:
+Install and run:
 
 ```bash
 pip install -e '.[dev]'
 uvicorn app.api:app --reload
 ```
 
-Write a feature row:
+Register a feature view:
 
 ```bash
-curl -X POST http://localhost:8000/features \
+curl -X POST http://localhost:8000/v1/views \
   -H 'content-type: application/json' \
   -d '{
-    "entity_id": "customer-42",
-    "event_time": "2026-02-01T12:00:00Z",
-    "values": {"txn_30d": 15, "avg_amount": 91.2, "risk_score": 0.71}
+    "name": "customer_risk",
+    "version": 1,
+    "entity_type": "customer",
+    "ttl_seconds": 3600,
+    "features": [
+      {"name": "txn_30d", "dtype": "integer"},
+      {"name": "avg_amount", "dtype": "float"},
+      {"name": "segment", "dtype": "string", "nullable": true}
+    ]
   }'
 ```
 
-Read **as of** a historical timestamp:
+Ingest an immutable row:
 
 ```bash
-curl 'http://localhost:8000/offline/customer-42?as_of=2026-02-01T12:30:00Z'
+curl -X POST http://localhost:8000/v1/features \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_name": "customer_risk",
+    "entity_id": "customer-42",
+    "event_time": "2026-02-01T12:00:00Z",
+    "ingestion_id": "warehouse-event-8841",
+    "values": {"txn_30d": 15, "avg_amount": 91.2}
+  }'
 ```
 
-Materialize new rows into the online store:
+Build a training set. Missing entities are explicit rather than silently dropped:
 
 ```bash
-curl -X POST 'http://localhost:8000/materialize?limit=1000'
+curl -X POST http://localhost:8000/v1/training-set \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_name": "customer_risk",
+    "created_before": "2026-03-01T00:00:00Z",
+    "examples": [
+      {"entity_id": "customer-42", "label_time": "2026-02-02T00:00:00Z"}
+    ]
+  }'
 ```
 
-Inspect serving freshness:
+Materialize and verify parity:
 
 ```bash
-curl http://localhost:8000/freshness
+curl -X POST 'http://localhost:8000/v1/materializations/online?owner=worker-a&limit=1000'
+curl http://localhost:8000/v1/online/customer_risk/customer-42
+curl http://localhost:8000/v1/parity/customer_risk/customer-42
 ```
 
-## Point-in-time correctness
+## Failure semantics
 
-Suppose a customer has feature snapshots at `10:00` and `14:00`. A training example whose label time is `12:00` must retrieve the `10:00` snapshot. Returning the `14:00` row would leak future information and artificially improve offline metrics.
+Write retries are safe only when they represent the same content. Reusing an ingestion ID or logical `(view, version, entity, event_time)` key with a different payload returns a typed `409 FeatureMutationError`. Corrections must use a new event time or an explicitly designed correction workflow; the storage layer never silently rewrites training history.
 
-The offline adapter therefore executes the conceptual query:
+The materializer acquires a renewable job lease inside `BEGIN IMMEDIATE`, scans rows by sequence, performs online compare-and-set writes, advances the cursor and releases the lease in one commit. A live lease owned by another worker returns `MaterializationLeaseError`. An expired lease can be recovered.
 
-```sql
-SELECT *
-FROM feature_rows
-WHERE entity_id = :entity
-  AND event_time <= :label_time
-ORDER BY event_time DESC
-LIMIT 1;
+## Evidence and verification
+
+```bash
+ruff check .
+ruff format --check .
+pytest -q
+feature-platform-evidence > reference-run.json
+docker build -t feature-platform .
 ```
 
-The behavior is covered by tests.
+CI independently verifies:
+
+1. lint, format, 18 behavioral tests and a JSON evidence artifact;
+2. wheel build plus installation into a clean virtual environment;
+3. multi-stage non-root container build plus a live health probe.
+
+The evidence command executes real registry, ingestion, two-batch materialization, point-in-time join and parity operations. Its booleans are computed from the run; they are not hard-coded benchmark claims.
 
 ## Repository layout
 
 ```text
-feature-store-lab/
-├── app/
-│   └── api.py
-├── storage/
-│   └── sqlite_store.py
-├── tests/
-│   └── test_service.py
-├── feature_store.py
-├── Dockerfile
-├── pyproject.toml
-└── .github/workflows/ci.yml
+feature_platform/
+├── errors.py       typed domain failures
+├── evidence.py     deterministic end-to-end evidence run
+├── models.py       schemas, rows and compatibility rules
+├── service.py      application boundary
+└── store.py        SQLite registry, offline/online store and materializer
+app/api.py          FastAPI app factory and v1 transport
+tests/              registry, ingestion, PIT, materialization and API tests
+feature_store.py    compatibility layer for the original public API
 ```
 
-## Production evolution
+## Honest production boundary
 
-The public project intentionally uses SQLite and an in-process online store so it is runnable anywhere. The same interfaces map naturally to:
+This repository proves feature-store semantics on one transactional database. It does not claim distributed warehouse-to-Redis atomicity. A production split-store design would use an outbox or CDC stream, consumer idempotency, warehouse partitioning, Redis Lua/CAS writes, reconciliation jobs, access control and per-view SLIs. Those concerns are named here to make the scaling boundary explicit, not presented as already implemented.
 
-| Concern | Local implementation | Production direction |
-|---|---|---|
-| Offline store | SQLite | S3/Parquet, BigQuery, Snowflake, PostgreSQL |
-| Online store | in-memory adapter | Redis / DynamoDB |
-| Orchestration | HTTP materialization call | Airflow / Dagster / scheduled job |
-| Freshness | watermark table | metrics + alerting |
-| Feature definitions | Python structures | registry / declarative feature specs |
-| Serving | FastAPI | Kubernetes / ECS / Cloud Run |
+## Interview surface
 
-## Interview topics demonstrated
-
-`point-in-time joins` · `training-serving skew` · `event time` · `materialization` · `online/offline stores` · `feature freshness` · `idempotency` · `data leakage` · `ML platform design`
-
-The goal is not to imitate Feast line-for-line; it is to make the core architecture small enough to inspect and explain end to end.
+`feature stores` · `point-in-time joins` · `event time vs ingestion time` · `schema evolution` · `training-serving skew` · `idempotency` · `leases` · `transactional checkpoints` · `late data` · `freshness SLOs` · `model platform APIs`
