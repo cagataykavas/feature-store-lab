@@ -139,9 +139,7 @@ def audit_numeric_drift(
     ):
         reference_share = (reference_count + epsilon) / reference_denominator
         current_share = (current_count + epsilon) / current_denominator
-        contribution = (current_share - reference_share) * math.log(
-            current_share / reference_share
-        )
+        contribution = (current_share - reference_share) * math.log(current_share / reference_share)
         psi += contribution
         missing = index == bucket_total - 1
         lower = None if index == 0 or missing else edges[index - 1]
