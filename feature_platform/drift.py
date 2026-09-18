@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import bisect
 import math
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from typing import Iterable
-
 
 @dataclass(frozen=True)
 class DriftBin:
