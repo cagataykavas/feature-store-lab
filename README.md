@@ -164,3 +164,33 @@ This repository proves feature-store semantics on one transactional database. It
 ## Interview surface
 
 `feature stores` · `point-in-time joins` · `event time vs ingestion time` · `schema evolution` · `training-serving skew` · `idempotency` · `leases` · `transactional checkpoints` · `late data` · `freshness SLOs` · `model platform APIs`
+
+
+## Numeric feature drift audit
+
+The dependency-free PSI audit in `feature_platform.drift` compares a production window with a
+reference window while keeping the monitoring contract explicit:
+
+- quantile edges are learned from the reference window only;
+- missing values have their own bin and missing-rate delta;
+- zero-count bins use configurable epsilon smoothing;
+- constant reference features still detect shifts in either direction;
+- invalid, non-finite and undersized samples fail closed;
+- the typed report includes per-bin evidence and serializes directly to JSON.
+
+```python
+from feature_platform.drift import audit_numeric_drift
+
+report = audit_numeric_drift(
+    reference=[12.0, 15.0, 18.0, 21.0] * 10,
+    current=[14.0, 19.0, 27.0, None] * 10,
+    minimum_samples=20,
+)
+print(report.severity, report.psi)
+```
+
+The default `stable / moderate / significant` cutoffs (0.10 and 0.25) are conventional
+operational starting points, not universal statistical guarantees. PSI does not identify a
+cause, measure prediction impact or replace significance testing. Production users should
+version the reference window and thresholds per feature, alert on sustained breaches, and pair
+the result with data-quality and model-performance signals.
