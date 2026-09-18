@@ -7,6 +7,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 
+
 @dataclass(frozen=True)
 class DriftBin:
     """One reference-derived bin in a PSI report."""
