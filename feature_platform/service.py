@@ -5,6 +5,11 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from feature_platform.materialization_health import (
+    MaterializationHealthPolicy,
+    MaterializationHealthReport,
+    evaluate_materialization_health,
+)
 from feature_platform.models import FeatureRow, FeatureView, TrainingExample
 from feature_platform.store import SQLiteFeatureRepository
 
@@ -62,3 +67,18 @@ class FeaturePlatform:
 
     def materialize(self, limit: int = 1000, *, owner: str | None = None) -> dict[str, Any]:
         return self.repository.materialize(owner=owner or f"worker-{uuid4()}", limit=limit)
+
+    def materialization_health(
+        self,
+        job_name: str = "online",
+        *,
+        maximum_backlog_rows: int = 1_000,
+        maximum_oldest_pending_seconds: float = 300.0,
+        now: datetime | None = None,
+    ) -> MaterializationHealthReport:
+        snapshot = self.repository.materialization_snapshot(job_name, now=now)
+        policy = MaterializationHealthPolicy(
+            maximum_backlog_rows=maximum_backlog_rows,
+            maximum_oldest_pending_seconds=maximum_oldest_pending_seconds,
+        )
+        return evaluate_materialization_health(snapshot, policy)

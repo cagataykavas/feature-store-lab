@@ -178,6 +178,20 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             job_name=job_name, owner=owner, limit=limit
         )
 
+    @application.get("/v1/materializations/{job_name}/health", response_model=None)
+    def materialization_health(
+        job_name: str,
+        request: Request,
+        maximum_backlog_rows: int = Query(default=1000, ge=0, le=10_000_000),
+        maximum_oldest_pending_seconds: float = Query(default=300.0, ge=0),
+    ) -> JSONResponse:
+        report = _platform(request).materialization_health(
+            job_name,
+            maximum_backlog_rows=maximum_backlog_rows,
+            maximum_oldest_pending_seconds=maximum_oldest_pending_seconds,
+        )
+        return JSONResponse(status_code=200 if report.ok else 503, content=report.as_dict())
+
     @application.get("/v1/online/{view_name}/{entity_id}")
     def online_features(view_name: str, entity_id: str, request: Request) -> dict[str, Any]:
         try:
