@@ -13,6 +13,7 @@ from feature_platform.errors import (
     FeatureViewNotFound,
     MaterializationLeaseError,
 )
+from feature_platform.materialization_health import MaterializationSnapshot
 from feature_platform.models import (
     FeatureDefinition,
     FeatureRow,
@@ -382,6 +383,56 @@ class SQLiteFeatureRepository:
             "previous_cursor": cursor,
             "new_cursor": new_cursor,
         }
+
+    def materialization_snapshot(
+        self,
+        job_name: str = "online",
+        *,
+        now: datetime | None = None,
+    ) -> MaterializationSnapshot:
+        """Read a transactionally consistent source/cursor/lease health snapshot."""
+
+        observed_at = utc(now or self._now())
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            job = connection.execute(
+                "SELECT * FROM materialization_jobs WHERE name = ?", (job_name,)
+            ).fetchone()
+            cursor = int(job["cursor_sequence"]) if job else 0
+            source = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS maximum FROM feature_rows"
+            ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT COUNT(*) AS rows, MIN(created_at) AS oldest_created_at
+                FROM feature_rows WHERE sequence > ?
+                """,
+                (cursor,),
+            ).fetchone()
+            connection.commit()
+
+        lease_until = (
+            datetime.fromisoformat(job["lease_until"])
+            if job and job["lease_until"] is not None
+            else None
+        )
+        job_updated_at = datetime.fromisoformat(job["updated_at"]) if job else None
+        oldest_pending = (
+            datetime.fromisoformat(pending["oldest_created_at"])
+            if pending["oldest_created_at"] is not None
+            else None
+        )
+        return MaterializationSnapshot(
+            job_name=job_name,
+            observed_at=observed_at,
+            cursor_sequence=cursor,
+            source_max_sequence=int(source["maximum"]),
+            backlog_rows=int(pending["rows"]),
+            oldest_pending_created_at=oldest_pending,
+            job_updated_at=job_updated_at,
+            lease_owner=str(job["lease_owner"]) if job and job["lease_owner"] else None,
+            lease_until=lease_until,
+        )
 
     def get_online(
         self, view_name: str, entity_id: str, *, now: datetime | None = None

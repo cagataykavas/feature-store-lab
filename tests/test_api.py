@@ -72,3 +72,43 @@ def test_api_returns_typed_conflict_for_mutation(tmp_path: Path) -> None:
         conflict = client.post("/v1/features", json=base)
         assert conflict.status_code == 409
         assert conflict.json()["error"] == "FeatureMutationError"
+
+
+def test_materialization_health_endpoint_is_probe_friendly(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "api.db")) as client:
+        client.post(
+            "/v1/views",
+            json={
+                "name": "risk",
+                "version": 1,
+                "entity_type": "customer",
+                "features": [{"name": "score", "dtype": "float"}],
+            },
+        )
+        client.post(
+            "/v1/features",
+            json={
+                "view_name": "risk",
+                "entity_id": "c-1",
+                "event_time": "2026-01-01T00:00:00Z",
+                "values": {"score": 0.8},
+            },
+        )
+
+        unhealthy = client.get(
+            "/v1/materializations/online/health",
+            params={"maximum_backlog_rows": 0},
+        )
+        assert unhealthy.status_code == 503
+        assert unhealthy.json()["issues"][0]["code"] == "backlog.rows_exceeded"
+
+        client.post("/v1/materializations/online", params={"owner": "worker"})
+        healthy = client.get(
+            "/v1/materializations/online/health",
+            params={
+                "maximum_backlog_rows": 0,
+                "maximum_oldest_pending_seconds": 0,
+            },
+        )
+        assert healthy.status_code == 200
+        assert healthy.json()["ok"] is True
